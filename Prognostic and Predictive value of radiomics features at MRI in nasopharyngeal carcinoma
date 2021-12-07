@@ -1,0 +1,941 @@
+# Read clinical information
+npc199.clinic <- read.csv("npc199_clinic.csv", header = TRUE, sep = ",")
+
+# Interval row selection
+npc199.clinic <- npc199.clinic[seq(1, 397, by=2), ]
+
+# Define the row name
+clinic <- read.csv("clinic.csv", header = TRUE, sep = ",")
+rowname.npc199 <- clinic$Patient
+row.names(clinic) <- rowname.npc199
+clinic <- clinic[, -1]
+
+# Read radiomics information
+npc199.radiomics <- read.csv("npc199_radiomics.csv", header = FALSE, sep = ",")
+
+# Define the line number
+row.index <- seq(1, 397, by=2)
+
+# Read CET1WI radiomics features
+npc199.radiomics.ce <- npc199.radiomics[row.index, ]
+ce.colname <- paste("ce", 1:1395, sep = ".")
+colnames(npc199.radiomics.ce) <- ce.colname
+row.names(npc199.radiomics.ce) <- rowname.npc199
+
+# Read T2WI radiomics features
+npc199.radiomics.t2 <- npc199.radiomics[-row.index, ]
+t2.colname <- paste("t2", 1:1395, sep = ".")
+colnames(npc199.radiomics.t2) <- t2.colname
+rownames(npc199.radiomics.t2) <- rowname.npc199
+
+# According to the result of Wilcoxon signed-rank test, CET1WI and T2WI radiomics features were selected respectively
+npc199.ce <- npc199.radiomics.ce[ ,t1.ind]
+npc199.t2 <- npc199.radiomics.t2[ ,t2.ind]
+
+radiomics199 <- cbind(npc199.ce, npc199.t2)
+npc199 <- cbind(npc199.clinic, radiomics199)
+
+# Patients were randomized grouped
+set.seed(867)
+sample.ind <- sample(nrow(npc199), 0.8*nrow(npc199))
+train199 <- radiomics199[sample.ind, ]
+test199 <- radiomics199[-sample.ind, ]
+train.clinic <- npc199.clinic[sample.ind, ]
+test.clinic <- npc199.clinic[-sample.ind, ]
+
+
+## table-one
+
+train.clinic$group <- 1
+test.clinic$group <- 0
+clinic.group <- rbind(train.clinic, test.clinic)
+
+library(tableone)
+str(clinic.group)
+names(clinic.group)
+vars <- c("Gender", "age", "Histology", "Tstage", "Nstage", "Overallstage",
+          "Treatment", "EGFR", "VEGF", "Prognosis", "Time")
+factorVars <- c("Gender", "Histology", "Tstage", "Nstage", "Overallstage",
+                "Treatment", "Prognosis", "EGFR", "VEGF")
+clinic.group[factorVars] <- lapply(clinic.group[factorVars], factor)
+numericVars <- c("age", "Time")
+clinic.group[numericVars] <- lapply(clinic.group[numericVars], as.numeric)
+
+tablegroup <- CreateTableOne(vars = vars, strata = "group", data = clinic.group)
+table1 <- print(tablegroup, cramVars = c("Gender", "Prognosis", "EGFR", "VEGF"))
+write.csv(table1, file = "tablegroup.csv")
+
+
+# Lasso regression
+
+library(glmnet) # Lasso regression
+library(survival)
+
+X <- as.matrix(train199) # Extract independent variables and store them in matrix format
+
+# Lasso regression
+
+
+Y <- as.matrix(train.clinic[, 1]) # Extract independent variables and store them in matrix format
+lasso <- glmnet(X ,Y, alpha = 1, family = "binomial") #Establishment LASSO model (Alpha: 0-ridge regression, 1-Lasso regression)
+print(lasso) # Find the minimum (optimal)lambda value
+plot(lasso, xvar = "lambda", label = TRUE) # Draw convergence curve
+lasso.coef <- coef(lasso, s=0.001427) # The regression coefficient when lambda value is 0.001427 is obtained
+lasso.coef
+
+lasso.ind <- which(lasso.coef!=0) 
+
+prob.lasso <- predict(lasso, newx = X, type = "response")
+summary(lasso)
+
+#lasso Cox regression
+
+time <- as.double(train.clinic$Time) #follow-up time 
+status <- as.double(train.clinic$Prognosis) #End-point event (censored events)
+surv.lasso <- Surv(time, status) # survival package，tiem and event
+lasso.cox <- glmnet(X, surv.lasso, family = "cox", alpha = 1) #X is the variable to be selected
+summary(lasso.cox)
+prob.lasso <- predict(lasso.cox, newx = X, type = "response")
+print(lasso.cox) #Find minimum value of lambda 
+lasso.cox.coef <- coef(lasso.cox, s=0.002274) # Make “s”= the minimum value of lambda, variable selection 
+lasso.cox.coef
+lasso.ind <- which(lasso.cox.coef!=0) 
+lasso.ind
+plot(lasso.cox)
+
+#Selecet radiomics features according to the results of LASSO regression
+
+train199.lasso <- train199[,lasso.ind]
+test199.lasso <- test199[,lasso.ind]
+
+
+# Heatmap of correlation coefficient
+
+library(corrplot)
+
+
+train199.matrix <- cor(train199.lasso)
+corrplot(train199.matrix) # Variable names cannot be too long
+
+#Calculate correlation coefficients and select variables（R>0.2，p<0.05）
+
+cor.ind <- NULL
+for(i in 1:160){
+  for(j in (i+1):161){
+    train199.cor.test<-cor.test(train199.lasso[,i], train199.lasso[,j], method = c("pearson"),conf.level = 0.95)
+    if((train199.cor.test$p.value<0.05)&(abs(train199.cor.test$estimate)>0.2))
+    {       
+      cor.ind<-c(cor.ind, j)
+    }       
+  }
+}
+cor.ind <- unique(cor.ind) #Remove duplicate value
+cor.ind
+train199.cor <- train199.lasso[, -cor.ind]
+test199.cor <- test199.lasso[, -cor.ind]
+
+final199 <- cbind(clinic.group, rbind(train199.cor, test199.cor))
+write.csv(final199, file = "npc15.csv")
+train <- cbind(train.clinic[, -12], train199.cor)
+test <- cbind(test.clinic[, -12], test199.cor)
+
+
+
+## cox regression modeling
+
+library(survival)
+library(survminer)
+
+train.radiomics <- train[, -c(3:11)]
+
+npc199.cox <- coxph(Surv(Time, Prognosis) ~ ., data = train.radiomics)
+summary(npc199.cox)
+
+coxVars <- c("ce.25")
+
+train.radiomics <- train.radiomics[, c(1,2,4)]
+test.radiomics <- cbind(test.clinic[,1:2], test199.cor$ce.25)
+fix(test.radiomics)
+
+fit.cox.train <- coxph(Surv(Time, Prognosis) ~ ., data = train.radiomics)
+
+cox.train.prob <- predict(fit.cox.train, newdata= train.radiomics, type = "risk")
+train.radiomics <- cbind(train.radiomics, cox.train.prob)
+
+cutoff.coxprob <- surv_cutpoint(train.radiomics, time = "Time", event = "Prognosis",
+                                variables = "cox.train.prob")
+plot(cutoff.coxprob)
+summary(cutoff.coxprob)
+
+train.radiomics.cat <- surv_categorize(cutoff.coxprob) # Rebuild the data set according to cutoff classification
+fix(train.radiomics.cat)
+train.radiomics.cat <- cbind(train.radiomics.cat, cox.train.prob)
+
+
+fit.surv.train <- survfit(Surv(Time, Prognosis) ~ radiomics.risk, data = train.radiomics.cat)
+ggsurvplot(fit.surv.train, data = train.radiomics.cat, risk.table = TRUE, conf.int = TRUE,
+           pval = TRUE, xlab = "Time(months)", risk.table.y.text = FALSE,
+           surv.median.line = "hv")
+
+## Cox score of validation group was calculated
+
+cox.test.prob <- predict(fit.cox.train, newdata= test.radiomics, type = "risk")
+test.radiomics <- cbind(test.radiomics, cox.test.prob)
+
+test.radiomics$radiomics.risk <- ifelse(test.radiomics$cox.test.prob<1.17, 0, 1)
+test.radiomics.cat <- test.radiomics[, c(1,2,6,7)]
+test.radiomics <- test.radiomics[, c(1,2,6)]
+
+fit.surv.test <- survfit(Surv(Time, Prognosis) ~ radiomics.risk, data = test.radiomics.cat)
+ggsurvplot(fit.surv.test, data = test.radiomics.cat, risk.table = TRUE, conf.int = TRUE,
+           pval = TRUE, xlab = "Time(months)", risk.table.y.text = FALSE,
+           surv.median.line = "hv")
+
+## 
+
+train.full <- cbind(train.clinic[, -12], train.radiomics[, -c(1,2)])
+
+train.full.cox <- coxph(Surv(Time, Prognosis) ~ ., data = train.full)
+summary(train.full.cox)
+
+
+library(survival)
+library(survminer)
+library(pROC)
+
+# Build the combined cohort
+
+ce.989 <- radiomics[, "ce.989"]
+npc199 <- cbind(clinic, ce.989)
+
+npc199.train <- npc199[sample.ind, ]
+train.cox.model <- coxph(Surv(Time, Prognosis) ~ .,
+                         data = npc199[,-9])
+cox.model <- summary(train.cox.model)
+cox.model
+cox.model$conf.int
+cox.model.table <- cbind(cox.model$conf.int[, 1],
+                         cox.model$conf.int[, 3:4],
+                         cox.model$coefficients[, 4:5])
+fix(cox.model.table)
+write.csv(cox.model.table, "cox.model.table.csv")
+# Clinical Information Grouped
+
+npc199$age.group <- ifelse(npc199$age < 40, 0, 1)
+npc199$T.group <- ifelse(npc199$Tstage <= 2, 0, 1)
+npc199$N.group <- ifelse(npc199$Nstage <= 2, 0, 1)
+npc199$stage.group <- ifelse(npc199$Overallstage <= 2, 0, 1)
+npc199$RadScore <- ifelse(npc199$ce.989 < 5.2, 0, 1)
+
+# Sampling and grouping
+set.seed(867)
+sample.ind <- sample(nrow(npc199), 0.8*nrow(npc199))
+
+npc199$group[sample.ind] <- 1
+npc199$group[-sample.ind] <- 2
+
+km.age <- survfit(Surv(Time, Prognosis) ~ RadScore,
+                  data = npc199)
+ggsurvplot(km.age, data = npc199,
+           risk.table = TRUE, conf.int = TRUE,
+           pval = TRUE, xlab = "Time(months)", risk.table.y.text = FALSE,
+           surv.median.line = "hv", 
+           legend.title = "RadScore",
+           break.x.by = 12,
+           legend = c(0.8,0.85),
+           legend.labs = c("Low Risk", "High Risk"),
+           title = "Full set")
+
+npc199$RadScore <- factor(npc199$RadScore, levels=c(1,0),
+                            labels=c("High Risk", "Low Risk"))
+npc199$status <- npc199$Prognosis
+npc199$status <- factor(npc199$status,
+                        levels = c(0, 1),
+                        labels = c("Non-Prognosis", "Prognosis"))
+
+train <- npc199[sample.ind, ]
+test <- npc199[-sample.ind, ]
+
+ggplot(npc199, aes(x= reorder(rownames(npc199), -ce.989), y=c(ce.989-5.2), fill = status))+ # X. Name as the x-coordinate, Cox. prob as the y-axis value, and Prognosis as the classification color
+  geom_bar(stat = "identity", position = "dodge")+ # “stat = "identity"”to display negative values, reverse direction 
+  labs(x = "", y = "Risk score of Radiomics-based Classifier", 
+       title = "Full set RadScore for every patient")+
+  theme(plot.title = element_text(hjust = 0.5))+
+  coord_cartesian(xlim = NULL, ylim = c(-0.2, 0.2))+
+  theme_survminer()+
+  theme(axis.text.x = element_blank())+
+  theme(panel.grid = element_blank())+
+  theme(axis.ticks.x = element_blank())+
+  scale_y_continuous(breaks = c(-0.2, -0.1, 0, 0.1, 0.2), 
+                     labels = c("5.0", "5.1", "5.2", "5.3", "5.4"))+
+  guides(fill=guide_legend(title=NULL))+#Remove legend and heading
+  theme(legend.position = c(0.5, 1),
+        legend.justification = c(0.5, 1),
+        legend.direction = "horizontal") 
+
+## 5-year survival (95%CI) and HR(95%CI) were calculated for the training set, validation set and the combined set
+
+train.cox1 <- coxph(Surv(Time, Prognosis) ~ ce989.group, data = train)
+train.km1 <- survfit(Surv(Time, Prognosis) ~ ce989.group, data = train)
+
+test.cox1 <- coxph(Surv(Time, Prognosis) ~ ce989.group, data = test)
+test.km1 <- survfit(Surv(Time, Prognosis) ~ ce989.group, data = test)
+
+full.cox1 <- coxph(Surv(Time, Prognosis) ~ ce989.group, data = npc199)
+full.km1 <- survfit(Surv(Time, Prognosis) ~ ce989.group, data = npc199)
+
+summary(train.km1, times = 60) ##Shows survival rates at a specific time
+summary(test.km1, times = 60) ##Shows survival rates at a specific time
+summary(full.km1, times = 60) ##Shows survival rates at a specific time
+# HR(95CI) and P values were extracted
+c(summary(full.cox1)$conf.int[, c(1,3,4)], summary(full.cox1)$coefficients[, 5])
+summary(test.cox1)
+
+## Plot time-dependent ROC curve
+
+library(survivalROC)
+library(timeROC)
+
+timeroc.full <- timeROC(T=npc199$Time,
+                         delta = npc199$Prognosis,
+                         marker = npc199$ce.989,
+                         cause = 1, weighting = "marginal",
+                         times = c(12,36,60,84),
+                         ROC = TRUE,
+                         iid = TRUE)
+timeroc.full
+confint(timeroc.full)$CI_AUC ## Calculate the 95% CI
+
+plot(timeroc.full, time = 36, lwd = 2, col = "red", title = FALSE)
+title("Time-dependent ROC curve for Full set")
+plot(timeroc.full, time = 60, add = TRUE, col = "blue", lwd = 2)
+legend("bottom", c("AUC at 3-years: 0.641", "AUC at 5-years: 0.626"),
+       col = c("red", "blue"),
+       lwd = 2,
+       bty = "n")
+
+## Caculate time dependent ROC in groups
+
+timeroc.train <- timeROC(T=train$Time,
+                        delta = train$Prognosis,
+                        marker = train$ce.989,
+                        cause = 1, weighting = "marginal",
+                        times = c(12,36,60,84),
+                        ROC = TRUE,
+                        iid = TRUE)
+timeroc.train
+confint(timeroc.train)$CI_AUC ## Calculate the 95% CI
+
+plot(timeroc.train, time = 36, lwd = 2, col = "red", title = FALSE)
+title("Time-dependent ROC curve for Training set")
+plot(timeroc.train, time = 60, add = TRUE, col = "blue", lwd = 2)
+legend("bottom", c("AUC at 3-years: 0.606", "AUC at 5-years: 0.604"),
+       col = c("red", "blue"),
+       lwd = 2,
+       bty = "n")
+
+timeroc.test <- timeROC(T=test$Time,
+                         delta = test$Prognosis,
+                         marker = test$ce.989,
+                         cause = 1, weighting = "marginal",
+                         times = c(12,36,60,84),
+                         ROC = TRUE,
+                         iid = TRUE)
+timeroc.test
+confint(timeroc.test)$CI_AUC ## Calculate the 95% CI
+
+plot(timeroc.test, time = 36, lwd = 2, col = "red", title = FALSE)
+title("Time-dependent ROC curve for Validation set")
+plot(timeroc.test, time = 60, add = TRUE, col = "blue", lwd = 2)
+legend("bottom", c("AUC at 3-years: 0.792", "AUC at 5-years: 0.732"),
+       col = c("red", "blue"),
+       lwd = 2,
+       bty = "n")
+
+## Select factors from clinical variables and ce.989, modeling
+
+train.cox <- coxph(Surv(Time, Prognosis) ~ Gender+age+Histology+EGFR+VEGF+
+                     Tstage+Nstage+Overallstage+Treatment+ce.989, data = train)
+summary(train.cox)
+coxVars <- c("Prognosis", "Time", "Histology", "Nstage", "ce.989")
+
+npc199.reduced <- npc199[, coxVars]
+train.reduced <- train[, coxVars]
+test.reduced <- test[, coxVars]
+
+# Develop model in training set with clinical and radiomics features
+train.cox.reduced <- coxph(Surv(Time, Prognosis) ~ ., data = train.reduced)
+
+# Develop model in training set with clinical features
+train.cox.clinic <- coxph(Surv(Time, Prognosis) ~ Histology+Nstage, data = train.reduced)
+
+# Caculate total risk coefficient with clinical-radiomics model in the trainig set
+risk.score.full <- predict(train.cox.reduced, newdata= npc199.reduced, type = "risk")
+
+# Caculate clinical risk coefficient with clinical model in the trainig set
+risk.score.clinic <- predict(train.cox.clinic, newdata= npc199.reduced, type = "risk")
+
+npc199.reduced <- cbind(npc199.reduced, risk.score.clinic, risk.score.full)
+
+timeroc.Histology <- timeROC(T=npc199.reduced$Time,
+                        delta = npc199.reduced$Prognosis,
+                        marker = -npc199.reduced$Histology,
+                        cause = 1, weighting = "marginal",
+                        times = c(12,36,60,84),
+                        ROC = TRUE,
+                        iid = TRUE)
+timeroc.Histology
+confint(timeroc.Histology)$CI_AUC ## Caculate 95% CI
+
+plot(timeroc.Histology, time = 60, lwd = 2, col = "red", title = FALSE)
+
+timeroc.Nstage <- timeROC(T=npc199.reduced$Time,
+                        delta = npc199.reduced$Prognosis,
+                        marker = npc199.reduced$Nstage,
+                        cause = 1, weighting = "marginal",
+                        times = c(12,36,60,84),
+                        ROC = TRUE,
+                        iid = TRUE)
+timeroc.Nstage
+confint(timeroc.Nstage)$CI_AUC ## Caculate 95% CI
+
+plot(timeroc.Nstage, time = 60, add = TRUE, lwd = 2, col = "green", title = FALSE)
+
+timeroc.ce989 <- timeROC(T=npc199.reduced$Time,
+                          delta = npc199.reduced$Prognosis,
+                          marker = npc199.reduced$ce.989,
+                          cause = 1, weighting = "marginal",
+                          times = c(12,36,60,84),
+                          ROC = TRUE,
+                          iid = TRUE)
+timeroc.ce989
+confint(timeroc.ce989)$CI_AUC ## Caculate 95% CI
+
+plot(timeroc.ce989, time = 60, add = TRUE, lwd = 2, col = "blue", title = FALSE)
+
+timeroc.clinic <- timeROC(T=npc199.reduced$Time,
+                          delta = npc199.reduced$Prognosis,
+                          marker = npc199.reduced$risk.score.clinic,
+                          cause = 1, weighting = "marginal",
+                          times = c(12,36,60,84),
+                          ROC = TRUE,
+                          iid = TRUE)
+timeroc.clinic
+confint(timeroc.clinic)$CI_AUC ## Caculate 95% CI
+
+plot(timeroc.clinic, time = 60, add = TRUE, lwd = 2, col = "orange", title = FALSE)
+
+timeroc.clin.radio <- timeROC(T=npc199.reduced$Time,
+                          delta = npc199.reduced$Prognosis,
+                          marker = npc199.reduced$risk.score.full,
+                          cause = 1, weighting = "marginal",
+                          times = c(12,36,60,84),
+                          ROC = TRUE,
+                          iid = TRUE)
+timeroc.clin.radio
+confint(timeroc.clin.radio)$CI_AUC ## Caculate 95% CI
+
+plot(timeroc.clin.radio, time = 60, add = TRUE, lwd = 2, col = "purple", title = FALSE)
+
+title("Time-dependent ROC curve at 5-years")
+
+legend("bottom", 
+       title = "",
+       c("RadScore and clinic:", 
+                        "combined clinic:",
+                        "RadScore:",
+                        "N stage:",
+                        "Histology:"),
+       col = c("purple", "orange", "blue", "green", "red"),
+       lwd = 2,
+       bty = "n")
+
+legend("bottomright", 
+       title = "AUC",
+       c("0.722", 
+         "0.690",
+         "0.626",
+         "0.677",
+         "0.573"),
+       lwd = 2,
+       bty = "n",
+       col = "white",
+       title.adj = 0,
+       adj = 1.5)
+
+## nomograph
+
+library(rms)
+
+npc.nomo <- npc199.reduced
+colnames(npc.nomo)[5] <- "RadScore"
+npc.nomo$Histology <- factor(npc.nomo$Histology,
+                             levels = c(1, 2),
+                             labels = c("Differentiated", "Undifferentiated"))
+npc.nomo$Nstage <- factor(npc.nomo$Nstage,
+                          levels = c(0, 1, 2, 3),
+                          labels = c("N0", "N1", "N2", "N3"))
+
+dd = datadist(npc.nomo)
+options(datadist="dd")
+f1 <- psm(Surv(Time, Prognosis) ~ Histology+Nstage+RadScore, data = npc.nomo,
+          dist = "lognormal",
+          x = TRUE, y = TRUE) # Develop calibaration curve x，y must be TRUE
+med <- Quantile(f1)
+surv <- Survival(f1)
+
+nomo.cox <- nomogram(f1, fun = list(function(x)surv(36, x),
+                                    function(x)surv(60, x),
+                                    function(x)med(lp=x)),
+                     funlabel=c("3-year DFS", "5-year DFS","Median DFS Time"))
+
+nomo.cox <- nomogram(f1, fun = list(function(x)surv(36, x),
+                                    function(x)surv(60, x)),
+                     funlabel=c("3-year DFS", "5-year DFS"),
+                     lp = FALSE)
+
+plot(nomo.cox, xfrac=0.4, cex.axis=1) # xfrac is the distance between the variable name and the line
+
+
+#  calibration curve of nomogram
+
+# Calibration curve - Method first, a curve
+cal1 <- calibrate(f1, cmethod = "KM", u = 60, method = "boot", B = 1000, m = 40)#计算5年校准曲线
+plot(cal1, xlim=c(0,0.8),ylim=c(0,0.8),
+     xlab="Nomogram-predicted DFS",
+     ylab="Observed DFS",
+     subtitles = FALSE,
+     errbar.col=c(rgb(0,118,192,maxColorValue=255)),
+     col=c(rgb(192,98,83,maxColorValue=255)),
+     lwd = 2)
+abline(0,1, col="black", lty=2, lwd=1)
+title("Calibrate Curve at 5-years")
+
+# Calibration curve - Method second, many curves
+
+cal3 <- calibrate(f1, cmethod = "KM", u = 36, method = "boot", B = 1000, m = 40)#计算3年校准曲线
+cal5 <- calibrate(f1, cmethod = "KM", u = 60, method = "boot", B = 1000, m = 40)#计算5年校准曲线
+
+plot(cal3,lwd = 2,lty = 0,errbar.col = c("#2166AC"),
+     bty = "l", #Draw only the left and bottom borders
+     subtitles = FALSE,
+     xlim = c(0.2,0.8),ylim= c(0.2,0.8),
+     xlab = "Nomogram-predicted DFS",ylab = "Observed DFS",
+     col = c("#2166AC"),
+     cex.lab=1.2,cex.axis=1, cex.main=1.2, cex.sub=0.6)
+lines(cal3[,c('mean.predicted',"KM")],
+      type = 'b', lwd = 1, col = c("#2166AC"), pch = 16)
+mtext("")
+
+plot(cal5,lwd = 2,lty = 0,errbar.col = c("#B2182B"),
+     xlim = c(0.2,0.8),ylim= c(0.2,0.8),col = c("#B2182B"),add = T)
+lines(cal5[,c('mean.predicted',"KM")],
+      type = 'b', lwd = 1, col = c("#B2182B"), pch = 16)
+
+abline(0,1, lwd = 2, lty = 3, col = c("#224444"))
+
+legend("topleft", #Location of legend
+       legend = c("3-year","5-year"), #legend text
+       col =c("#2166AC","#B2182B"), #The color of the legend line corresponds to the text
+       lwd = 2,#The thickness of the line in the legend
+       cex = 1.2,#Legend font size
+       bty = "n")#The legend border is not displayed
+
+
+##  Calculate clinical survival information
+
+clinic.cox <- clinic[, -9]
+clinic.cox <- clinic.cox[sample.ind, ]
+
+clinic.cox1 <- coxph(Surv(Time, Prognosis) ~ ., data = clinic.cox)
+summary(clinic.cox1)
+
+
+##  timeROC，full1、train1，test1
+
+full1 <- npc199
+full1 <- full1[, c(10, 11, 12, 3, 7)]
+fix(full1)
+
+full1 <- cbind(npc199.reduced[, c(1,2,4)], full1[, c(4,3)], npc199.reduced[, c(6,7)])
+full1$Histology[full1$Histology == 2] <- 0
+train1 <- full1[sample.ind,]
+test1 <- full1[-sample.ind,]
+
+##Develop time dependent ROC
+
+#Combined set
+Nstage.roc.full <- timeROC(T=full1$Time,
+                        delta = full1$Prognosis,
+                        marker = full1$Nstage,
+                        cause = 1, weighting = "marginal",
+                        times = c(12,36,60,84),
+                        ROC = TRUE,
+                        iid = TRUE)
+
+Histology.roc.full <- timeROC(T=full1$Time,
+                           delta = full1$Prognosis,
+                           marker = full1$Histology,
+                           cause = 1, weighting = "marginal",
+                           times = c(12,36,60,84),
+                           ROC = TRUE,
+                           iid = TRUE)
+
+radscore.roc.full <- timeROC(T=full1$Time,
+                           delta = full1$Prognosis,
+                           marker = full1$RadScore,
+                           cause = 1, weighting = "marginal",
+                           times = c(12,36,60,84),
+                           ROC = TRUE,
+                           iid = TRUE)
+
+clinic.roc.full <- timeROC(T=full1$Time,
+                           delta = full1$Prognosis,
+                           marker = full1$risk.score.clinic,
+                           cause = 1, weighting = "marginal",
+                           times = c(12,36,60,84),
+                           ROC = TRUE,
+                           iid = TRUE)
+
+radclinic.roc.full <- timeROC(T=full1$Time,
+                           delta = full1$Prognosis,
+                           marker = full1$risk.score.full,
+                           cause = 1, weighting = "marginal",
+                           times = c(12,36,60,84),
+                           ROC = TRUE,
+                           iid = TRUE)
+
+radclinic.roc.full
+clinic.roc.full
+radscore.roc.full
+Nstage.roc.full
+Histology.roc.full
+
+confint(radclinic.roc.full)$CI_AUC
+confint(clinic.roc.full)$CI_AUC
+confint(radscore.roc.full)$CI_AUC
+confint(Nstage.roc.full)$CI_AUC
+confint(Histology.roc.full)$CI_AUC
+
+pdf("time dependent ROC.pdf")
+plot(radclinic.roc.full, time = 60, lwd = 2, col = "purple", title = FALSE)
+plot(clinic.roc.full, time = 60, add = TRUE, lwd = 2, col = "orange", title = FALSE)
+plot(radscore.roc.full, time = 60, add = TRUE, lwd = 2, col = "blue", title = FALSE)
+plot(Nstage.roc.full, time = 60, add = TRUE, lwd = 2, col = "green", title = FALSE)
+plot(Histology.roc.full, time = 60, add = TRUE, lwd = 2, col = "red", title = FALSE)
+title("Time-dependent ROC curve at 5-years Full set")
+
+legend("bottom", 
+       title = "",
+       c("RadScore and clinic", 
+         "Combined clinic",
+         "RadScore",
+         "N stage",
+         "Histology"),
+       col = c("purple", "orange", "blue", "green", "red"),
+       lwd = 2,
+       bty = "n")
+
+legend("bottomright", 
+       title = "AUC",
+       c("0.735", 
+         "0.712",
+         "0.626",
+         "0.677",
+         "0.573"),
+       lwd = 2,
+       bty = "n",
+       col = "white",
+       title.adj = 0,
+       adj = 1.5)
+
+plot(radclinic.roc.full, time = 36, lwd = 2, col = "purple", title = FALSE)
+plot(clinic.roc.full, time = 36, add = TRUE, lwd = 2, col = "orange", title = FALSE)
+plot(radscore.roc.full, time = 36, add = TRUE, lwd = 2, col = "blue", title = FALSE)
+plot(Nstage.roc.full, time = 36, add = TRUE, lwd = 2, col = "green", title = FALSE)
+plot(Histology.roc.full, time = 36, add = TRUE, lwd = 2, col = "red", title = FALSE)
+title("Time-dependent ROC curve at 3-years Full set")
+
+legend("bottom", 
+       title = "",
+       c("RadScore and clinic", 
+         "Combined clinic",
+         "RadScore",
+         "N stage",
+         "Histology"),
+       col = c("purple", "orange", "blue", "green", "red"),
+       lwd = 2,
+       bty = "n")
+
+legend("bottomright", 
+       title = "AUC",
+       c("0.756", 
+         "0.730",
+         "0.641",
+         "0.695",
+         "0.560"),
+       lwd = 2,
+       bty = "n",
+       col = "white",
+       title.adj = 0,
+       adj = 1.5)
+
+#training set
+
+Nstage.roc.train <- timeROC(T=train1$Time,
+                           delta = train1$Prognosis,
+                           marker = train1$Nstage,
+                           cause = 1, weighting = "marginal",
+                           times = c(12,36,60,84),
+                           ROC = TRUE,
+                           iid = TRUE)
+
+Histology.roc.train <- timeROC(T=train1$Time,
+                              delta = train1$Prognosis,
+                              marker = train1$Histology,
+                              cause = 1, weighting = "marginal",
+                              times = c(12,36,60,84),
+                              ROC = TRUE,
+                              iid = TRUE)
+
+radscore.roc.train <- timeROC(T=train1$Time,
+                             delta = train1$Prognosis,
+                             marker = train1$RadScore,
+                             cause = 1, weighting = "marginal",
+                             times = c(12,36,60,84),
+                             ROC = TRUE,
+                             iid = TRUE)
+
+clinic.roc.train <- timeROC(T=train1$Time,
+                           delta = train1$Prognosis,
+                           marker = train1$risk.score.clinic,
+                           cause = 1, weighting = "marginal",
+                           times = c(12,36,60,84),
+                           ROC = TRUE,
+                           iid = TRUE)
+
+radclinic.roc.train <- timeROC(T=train1$Time,
+                              delta = train1$Prognosis,
+                              marker = train1$risk.score.full,
+                              cause = 1, weighting = "marginal",
+                              times = c(12,36,60,84),
+                              ROC = TRUE,
+                              iid = TRUE)
+
+
+radclinic.roc.train
+clinic.roc.train
+radscore.roc.train
+Nstage.roc.train
+Histology.roc.train
+
+confint(radclinic.roc.train)$CI_AUC
+confint(clinic.roc.train)$CI_AUC
+confint(radscore.roc.train)$CI_AUC
+confint(Nstage.roc.train)$CI_AUC
+confint(Histology.roc.train)$CI_AUC
+
+plot(radclinic.roc.train, time = 60, lwd = 2, col = "purple", title = FALSE)
+plot(clinic.roc.train, time = 60, add = TRUE, lwd = 2, col = "orange", title = FALSE)
+plot(radscore.roc.train, time = 60, add = TRUE, lwd = 2, col = "blue", title = FALSE)
+plot(Nstage.roc.train, time = 60, add = TRUE, lwd = 2, col = "green", title = FALSE)
+plot(Histology.roc.train, time = 60, add = TRUE, lwd = 2, col = "red", title = FALSE)
+title("Time-dependent ROC curve at 5-years Train set")
+
+legend("bottom", 
+       title = "",
+       c("RadScore and clinic", 
+         "Combined clinic",
+         "RadScore",
+         "N stage",
+         "Histology"),
+       col = c("purple", "orange", "blue", "green", "red"),
+       lwd = 2,
+       bty = "n")
+
+legend("bottomright", 
+       title = "AUC",
+       c("0.740", 
+         "0.711",
+         "0.604",
+         "0.671",
+         "0.589"),
+       lwd = 2,
+       bty = "n",
+       col = "white",
+       title.adj = 0,
+       adj = 1.5)
+
+plot(radclinic.roc.train, time = 36, lwd = 2, col = "purple", title = FALSE)
+plot(clinic.roc.train, time = 36, add = TRUE, lwd = 2, col = "orange", title = FALSE)
+plot(radscore.roc.train, time = 36, add = TRUE, lwd = 2, col = "blue", title = FALSE)
+plot(Nstage.roc.train, time = 36, add = TRUE, lwd = 2, col = "green", title = FALSE)
+plot(Histology.roc.train, time = 36, add = TRUE, lwd = 2, col = "red", title = FALSE)
+title("Time-dependent ROC curve at 3-years Train set")
+
+legend("bottom", 
+       title = "",
+       c("RadScore and clinic", 
+         "Combined clinic",
+         "RadScore",
+         "N stage",
+         "Histology"),
+       col = c("purple", "orange", "blue", "green", "red"),
+       lwd = 2,
+       bty = "n")
+
+legend("bottomright", 
+       title = "AUC",
+       c("0.751", 
+         "0.726",
+         "0.606",
+         "0.686",
+         "0.561"),
+       lwd = 2,
+       bty = "n",
+       col = "white",
+       title.adj = 0,
+       adj = 1.5)
+
+#validation set
+
+Nstage.roc.test <- timeROC(T=test1$Time,
+                           delta = test1$Prognosis,
+                           marker = test1$Nstage,
+                           cause = 1, weighting = "marginal",
+                           times = c(12,36,60,84),
+                           ROC = TRUE,
+                           iid = TRUE)
+
+Histology.roc.test <- timeROC(T=test1$Time,
+                              delta = test1$Prognosis,
+                              marker = test1$Histology,
+                              cause = 1, weighting = "marginal",
+                              times = c(12,36,60,84),
+                              ROC = TRUE,
+                              iid = TRUE)
+
+radscore.roc.test <- timeROC(T=test1$Time,
+                             delta = test1$Prognosis,
+                             marker = test1$RadScore,
+                             cause = 1, weighting = "marginal",
+                             times = c(12,36,60,84),
+                             ROC = TRUE,
+                             iid = TRUE)
+
+clinic.roc.test <- timeROC(T=test1$Time,
+                           delta = test1$Prognosis,
+                           marker = test1$risk.score.clinic,
+                           cause = 1, weighting = "marginal",
+                           times = c(12,36,60,84),
+                           ROC = TRUE,
+                           iid = TRUE)
+
+radclinic.roc.test <- timeROC(T=test1$Time,
+                              delta = test1$Prognosis,
+                              marker = test1$risk.score.full,
+                              cause = 1, weighting = "marginal",
+                              times = c(12,36,60,84),
+                              ROC = TRUE,
+                              iid = TRUE)
+
+radclinic.roc.test
+clinic.roc.test
+radscore.roc.test
+Nstage.roc.test
+Histology.roc.test
+
+confint(radclinic.roc.test)$CI_AUC
+confint(clinic.roc.test)$CI_AUC
+confint(radscore.roc.test)$CI_AUC
+confint(Nstage.roc.test)$CI_AUC
+confint(Histology.roc.test)$CI_AUC
+
+
+plot(radclinic.roc.test, time = 60, lwd = 2, col = "purple", title = FALSE)
+plot(clinic.roc.test, time = 60, add = TRUE, lwd = 2, col = "orange", title = FALSE)
+plot(radscore.roc.test, time = 60, add = TRUE, lwd = 2, col = "blue", title = FALSE)
+plot(Nstage.roc.test, time = 60, add = TRUE, lwd = 2, col = "green", title = FALSE)
+plot(Histology.roc.test, time = 60, add = TRUE, lwd = 2, col = "red", title = FALSE)
+title("Time-dependent ROC curve at 5-years Validation set")
+
+legend("bottom", 
+       title = "",
+       c("RadScore and clinic", 
+         "Combined clinic",
+         "RadScore",
+         "N stage",
+         "Histology"),
+       col = c("purple", "orange", "blue", "green", "red"),
+       lwd = 2,
+       bty = "n")
+
+legend("bottomright", 
+       title = "AUC",
+       c("0.727", 
+         "0.704",
+         "0.732",
+         "0.682",
+         "0.510"),
+       lwd = 2,
+       bty = "n",
+       col = "white",
+       title.adj = 0,
+       adj = 1.5)
+
+plot(radclinic.roc.test, time = 36, lwd = 2, col = "purple", title = FALSE)
+plot(clinic.roc.test, time = 36, add = TRUE, lwd = 2, col = "orange", title = FALSE)
+plot(radscore.roc.test, time = 36, add = TRUE, lwd = 2, col = "blue", title = FALSE)
+plot(Nstage.roc.test, time = 36, add = TRUE, lwd = 2, col = "green", title = FALSE)
+plot(Histology.roc.test, time = 36, add = TRUE, lwd = 2, col = "red", title = FALSE)
+title("Time-dependent ROC curve at 3-years Validation set")
+
+legend("bottom", 
+       title = "",
+       c("RadScore and clinic", 
+         "Combined clinic",
+         "RadScore",
+         "N stage",
+         "Histology"),
+       col = c("purple", "orange", "blue", "green", "red"),
+       lwd = 2,
+       bty = "n")
+
+legend("bottomright", 
+       title = "AUC",
+       c("0.784", 
+         "0.741",
+         "0.792",
+         "0.713",
+         "0.560"),
+       lwd = 2,
+       bty = "n",
+       col = "white",
+       title.adj = 0,
+       adj = 1.5)
+
+dev.off()
+
+##compare two time-dependent ROC
+##combined set
+compare(radclinic.roc.full, clinic.roc.full)
+compare(radclinic.roc.full, radscore.roc.full)
+compare(radclinic.roc.full, Nstage.roc.full)
+compare(radclinic.roc.full, Histology.roc.full)
+compare(clinic.roc.full, radscore.roc.full)
+
+##training set
+
+compare(radclinic.roc.train, clinic.roc.train)
+compare(radclinic.roc.train, radscore.roc.train)
+compare(radclinic.roc.train, Nstage.roc.train)
+compare(radclinic.roc.train, Histology.roc.train)
+compare(clinic.roc.train, radscore.roc.train)
+
+##validation set
+
+compare(radclinic.roc.test, clinic.roc.test)
+compare(radclinic.roc.test, radscore.roc.test)
+compare(radclinic.roc.test, Nstage.roc.test)
+compare(radclinic.roc.test, Histology.roc.test)
+compare(clinic.roc.test, radscore.roc.test)
